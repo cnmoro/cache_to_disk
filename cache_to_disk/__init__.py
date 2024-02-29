@@ -29,11 +29,12 @@ Modifications:
             Base directory for cache files: $DISK_CACHE_DIR
         - Expansion of shell variables and tilde-user values for directories/files
 """
-import json, logging, os, pickle, warnings, fasteners
+import json, logging, os, pickle, warnings
 from collections import namedtuple
 from copy import deepcopy
 from datetime import datetime
 from os import getenv
+from filelock import SoftFileLock
 from os.path import (
     dirname,
     exists as file_exists,
@@ -108,16 +109,21 @@ class NoCacheCondition(Exception):
         self.function_value = function_value
         logger.info('NoCacheCondition caught in cache_to_disk')
 
+def get_lock_file(file_path):
+    return file_path + '.lock'
+
 def write_cache_file(cache_metadata_dict):
     """Dump an object as JSON to a file with a file lock"""
-    with fasteners.InterProcessLock(DISK_CACHE_FILE + '.lock'):
+    lock = SoftFileLock(get_lock_file(DISK_CACHE_FILE))
+    with lock:
         with open(DISK_CACHE_FILE, 'w') as f:
-            return json.dump(cache_metadata_dict, f)
+            json.dump(cache_metadata_dict, f)
 
 def load_cache_metadata_json():
     """Load a JSON file, create it with empty cache structure if it doesn't exist"""
+    lock = SoftFileLock(get_lock_file(DISK_CACHE_FILE))
     try:
-        with fasteners.InterProcessLock(DISK_CACHE_FILE + '.lock'):
+        with lock:
             with open(DISK_CACHE_FILE, 'r') as f:
                 return json.load(f)
     except FileNotFoundError:
@@ -133,27 +139,27 @@ def ensure_dir(directory):
 def pickle_big_data(data, file_path):
     """Write a pickled Python object to a file in chunks with a file lock."""
     bytes_out = pickle.dumps(data, protocol=4)
-    lock_file_path = file_path + '.lock'
-    with fasteners.InterProcessLock(lock_file_path):
+    lock = SoftFileLock(get_lock_file(file_path))
+    with lock:
         with open(file_path, 'wb') as f_out:
             for idx in range(0, len(bytes_out), MAX_PICKLE_BYTES):
                 f_out.write(bytes_out[idx:idx + MAX_PICKLE_BYTES])
 
 def unpickle_big_data(file_path):
     """Return a Python object from a file containing pickled data in chunks, with file lock."""
-    lock_file_path = file_path + '.lock'
-    with fasteners.InterProcessLock(lock_file_path):
+    lock = SoftFileLock(get_lock_file(file_path))
+    with lock:
         try:
             with open(file_path, 'rb') as f:
                 return pickle.load(f)
-        except Exception:  # noqa, pylint: disable=broad-except
+        except Exception:
             bytes_in = bytearray(0)
             input_size = os.path.getsize(file_path)
             with open(file_path, 'rb') as f_in:
                 for _ in range(0, input_size, MAX_PICKLE_BYTES):
                     bytes_in += f_in.read(MAX_PICKLE_BYTES)
             return pickle.loads(bytes_in)
-
+        
 def get_age_of_file(filename, unit='days'):
     """Return relative age of a file as a datetime.timedelta"""
     age = (datetime.today() - datetime.fromtimestamp(getmtime(filename)))
