@@ -30,6 +30,9 @@ Modifications:
         - Expansion of shell variables and tilde-user values for directories/files
 """
 # Standard Library
+import sqlite3
+import threading
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -60,6 +63,29 @@ DISK_CACHE_DIR = expanduser(expandvars(
 DISK_CACHE_FILE = expanduser(expandvars(join_path(
     DISK_CACHE_DIR, getenv('DISK_CACHE_FILENAME', 'cache_to_disk_caches.json'))))
 
+cache_lock = threading.Lock()
+# Connect to the SQLite database
+@contextmanager
+def connect_to_db():
+    with cache_lock:
+        conn = sqlite3.connect(DISK_CACHE_FILE)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+def init_db():
+    with connect_to_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS cache (
+                            function_name TEXT,
+                            args TEXT,
+                            kwargs TEXT,
+                            value BLOB,
+                            max_age_days INTEGER,
+                            timestamp INTEGER)''')
+        conn.commit()
+            
 # Specify 0 for cache age days to keep forever; not recommended for obvious reasons
 UNLIMITED_CACHE_AGE = 0
 DEFAULT_CACHE_AGE = 7
@@ -120,19 +146,38 @@ class NoCacheCondition(Exception):
 
 
 def write_cache_file(cache_metadata_dict):
-    """Dump an object as JSON to a file"""
-    with open(DISK_CACHE_FILE, 'w') as f:
-        return json.dump(cache_metadata_dict, f)
+    with connect_to_db() as conn:
+        cursor = conn.cursor()
+        for function_name, function_caches in cache_metadata_dict.items():
+            for function_cache in function_caches:
+                cursor.execute('''INSERT INTO cache (function_name, args, kwargs, value, max_age_days, timestamp)
+                                  VALUES (?, ?, ?, ?, ?, ?)''',
+                               (function_name, function_cache['args'], function_cache['kwargs'],
+                                pickle.dumps(function_cache['value']), function_cache['max_age_days'],
+                                function_cache['timestamp']))
+        conn.commit()
 
 
 def load_cache_metadata_json():
-    """Load a JSON file, create it with empty cache structure if it doesn't exist"""
-    try:
-        with open(DISK_CACHE_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        write_cache_file({_TOTAL_NUMCACHE_KEY: 0})
-        return {_TOTAL_NUMCACHE_KEY: 0}
+    with connect_to_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM cache')
+        rows = cursor.fetchall()
+        cache_metadata = {_TOTAL_NUMCACHE_KEY: 0}
+        for row in rows:
+            function_name, args, kwargs, value, max_age_days, timestamp = row
+            function_cache = {
+                'args': args,
+                'kwargs': kwargs,
+                'value': pickle.loads(value),
+                'max_age_days': max_age_days,
+                'timestamp': timestamp
+            }
+            if function_name not in cache_metadata:
+                cache_metadata[function_name] = []
+            cache_metadata[function_name].append(function_cache)
+            cache_metadata[_TOTAL_NUMCACHE_KEY] += 1
+        return cache_metadata
 
 
 def ensure_dir(directory):
@@ -232,33 +277,24 @@ def delete_disk_caches_for_function(function_name):
 
 
 def cache_exists(cache_metadata, function_name, *args, **kwargs):
-    if function_name not in cache_metadata:
-        return False, None
-    new_caches_for_function = []
-    cache_changed = False
-    for function_cache in cache_metadata[function_name]:
-        if function_cache['args'] == str(args) and (
-                function_cache['kwargs'] == str(kwargs)):
-            max_age_days = int(function_cache['max_age_days'])
-            file_name = join_path(DISK_CACHE_DIR, function_cache['file_name'])
-            if file_exists(file_name):
-                if get_age_of_file(file_name) > max_age_days != UNLIMITED_CACHE_AGE:
-                    os.remove(file_name)
-                    cache_changed = True
-                else:
-                    function_value = unpickle_big_data(file_name)
-                    return True, function_value
-            else:
-                cache_changed = True
-        else:
-            new_caches_for_function.append(function_cache)
-    if cache_changed:
-        if new_caches_for_function:
-            cache_metadata[function_name] = new_caches_for_function
-        else:
-            cache_metadata.pop(function_name)
-        write_cache_file(cache_metadata)
-    return False, None
+    with connect_to_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT * FROM cache
+                          WHERE function_name=? AND args=? AND kwargs=?''',
+                       (function_name, str(args), str(kwargs)))
+        row = cursor.fetchone()
+        if row is None:
+            return False, None
+        function_value = pickle.loads(row[3])
+        max_age_days = row[4]
+        timestamp = row[5]
+        if (datetime.now() - datetime.fromtimestamp(timestamp)).days > max_age_days != UNLIMITED_CACHE_AGE:
+            cursor.execute('''DELETE FROM cache
+                              WHERE function_name=? AND args=? AND kwargs=?''',
+                           (function_name, str(args), str(kwargs)))
+            conn.commit()
+            return False, None
+        return True, function_value
 
 
 def cache_function_value(
@@ -268,22 +304,14 @@ def cache_function_value(
         function_name,
         *args,
         **kwargs):
-    if function_name == _TOTAL_NUMCACHE_KEY:
-        raise Exception(
-            'Cant cache function named %s' % _TOTAL_NUMCACHE_KEY)
-    function_caches = cache_metadata.get(function_name, [])
-    new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + '.pkl'
-    new_cache = {
-        'args': str(args),
-        'kwargs': str(kwargs),
-        'file_name': new_file_name,
-        'max_age_days': n_days_to_cache
-    }
-    pickle_big_data(function_value, join_path(DISK_CACHE_DIR, new_file_name))
-    function_caches.append(new_cache)
-    cache_metadata[function_name] = function_caches
-    cache_metadata[_TOTAL_NUMCACHE_KEY] = int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1
-    write_cache_file(cache_metadata)
+    with connect_to_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO cache (function_name, args, kwargs, value, max_age_days, timestamp)
+                          VALUES (?, ?, ?, ?, ?, ?)''',
+                       (function_name, str(args), str(kwargs),
+                        pickle.dumps(function_value), n_days_to_cache,
+                        int(datetime.timestamp(datetime.now()))))
+        conn.commit()
 
 
 def cache_to_disk(n_days_to_cache=DEFAULT_CACHE_AGE):
@@ -365,7 +393,9 @@ def _cache_to_disk_wrapper(original_func, n_days_to_cache, _CacheInfo):  # noqa,
     wrapper.cache_size = cache_size
     wrapper.cache_get_raw = cache_get_raw
     return wrapper
-
-
+    
 ensure_dir(DISK_CACHE_DIR)
 delete_old_disk_caches()
+
+# Initialize the SQLite database
+init_db()
