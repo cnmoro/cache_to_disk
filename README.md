@@ -1,3 +1,6 @@
+# fork modifications
+This fork modifies the code, so it is thread safe. (using "filelock" dependency)
+
 # cache_to_disk
 Local disk caching decorator for python functions with auto-invalidation.
 

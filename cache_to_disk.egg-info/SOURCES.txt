@@ -1,7 +1,0 @@
-README.md
-setup.py
-cache_to_disk/__init__.py
-cache_to_disk.egg-info/PKG-INFO
-cache_to_disk.egg-info/SOURCES.txt
-cache_to_disk.egg-info/dependency_links.txt
-cache_to_disk.egg-info/top_level.txt
