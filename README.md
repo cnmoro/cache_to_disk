@@ -8,7 +8,7 @@ This is intended to cache functions that both take a long time to run, and have 
 
 # Installation
 ```bash
-pip install cache_to_disk
+pip install git+https://github.com/cnmoro/cache_to_disk_safe.git
 ```
 
 # Functions:
