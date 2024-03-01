@@ -10,7 +10,7 @@ setuptools.setup(
     author_email="sarenehan@gmail.com",
     description="Local disk caching decorator for python function.",
     long_description=long_description,
-    install_requires=[filelock]
+    install_requires=["filelock"],
     long_description_content_type="text/markdown",
     url="https://github.com/sarenehan/cache_to_disk",
     packages=setuptools.find_packages(),
