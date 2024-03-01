@@ -29,6 +29,8 @@ Modifications:
             Base directory for cache files: $DISK_CACHE_DIR
         - Expansion of shell variables and tilde-user values for directories/files
 """
+import asyncio
+from functools import wraps
 import json, logging, os, pickle, warnings
 from collections import namedtuple
 from copy import deepcopy
@@ -275,20 +277,57 @@ def cache_function_value(
     write_cache_file(cache_metadata)
 
 def cache_to_disk(n_days_to_cache=DEFAULT_CACHE_AGE):
-    """Cache to disk"""
+    """Adapted cache to disk decorator to support both async and sync functions."""
     if n_days_to_cache == UNLIMITED_CACHE_AGE:
         warnings.warn('Using an unlimited age cache is not recommended', stacklevel=3)
-    if isinstance(n_days_to_cache, int):
-        if n_days_to_cache < 0:
-            n_days_to_cache = 0
-    elif n_days_to_cache is not None:
-        raise TypeError('Expected n_days_to_cache to be an integer or None')
+    if not isinstance(n_days_to_cache, int) or n_days_to_cache < 0:
+        raise TypeError('Expected n_days_to_cache to be a non-negative integer')
 
-    def decorating_function(original_function):
-        wrapper = _cache_to_disk_wrapper(original_function, n_days_to_cache, _CacheInfo)
-        return wrapper
+    def decorator(original_function):
+        if asyncio.iscoroutinefunction(original_function):
+            @wraps(original_function)
+            async def async_wrapper(*args, **kwargs):
+                cache_metadata = load_cache_metadata_json()
+                already_cached, function_value = cache_exists(
+                    cache_metadata, original_function.__name__, *args, **kwargs)
+                if already_cached:
+                    logger.debug('Cache HIT on %s (async)', original_function.__name__)
+                    return function_value
+                
+                logger.debug('Cache MISS on %s (async)', original_function.__name__)
+                function_value = await original_function(*args, **kwargs)
+                cache_function_value(
+                    function_value,
+                    n_days_to_cache,
+                    cache_metadata,
+                    original_function.__name__,
+                    *args,
+                    **kwargs)
+                return function_value
+            return async_wrapper
+        else:
+            @wraps(original_function)
+            def sync_wrapper(*args, **kwargs):
+                cache_metadata = load_cache_metadata_json()
+                already_cached, function_value = cache_exists(
+                    cache_metadata, original_function.__name__, *args, **kwargs)
+                if already_cached:
+                    logger.debug('Cache HIT on %s (sync)', original_function.__name__)
+                    return function_value
 
-    return decorating_function
+                logger.debug('Cache MISS on %s (sync)', original_function.__name__)
+                function_value = original_function(*args, **kwargs)
+                cache_function_value(
+                    function_value,
+                    n_days_to_cache,
+                    cache_metadata,
+                    original_function.__name__,
+                    *args,
+                    **kwargs)
+                return function_value
+            return sync_wrapper
+
+    return decorator
 
 def _cache_to_disk_wrapper(original_func, n_days_to_cache, _CacheInfo):
     hits = misses = nocache = 0
